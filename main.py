@@ -4,50 +4,123 @@ import subprocess
 import os
 import sys
 import time
-import platform
 import threading
+import shutil
 from datetime import datetime, timedelta
+from flask import Flask, request
+import json
+
+# --- FLASK APP FOR RENDER ---
+app = Flask(__name__)
 
 # --- CONFIGURATION ---
 API_TOKEN = '8648889248:AAHfjrwpF9tDkLMoYQDHO_3nZB1pt4UJoGs'
-ADMIN_USERNAME = '@mgzan201' 
-ADMIN_CHAT_ID = "7592705124"  # အထူးအခွင့်အရေးရမည့် Admin Chat ID
+ADMIN_USERNAME = '@mgzan201'
+ADMIN_CHAT_ID = "7592705124"
+
+# Get Render URL from environment
+RENDER_URL = os.environ.get('RENDER_URL', 'https://vortexa-bot.onrender.com')
+
 bot = telebot.TeleBot(API_TOKEN)
 
-# Directory Setup
+# --- DIRECTORY SETUP ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HOST_DIR = os.path.join(BASE_DIR, "hosted_bots")
 if not os.path.exists(HOST_DIR):
     os.makedirs(HOST_DIR)
 
-# Global Trackers
+# Save data file
+DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
+
+# --- GLOBAL TRACKERS ---
 running_processes = {}
 start_times = {}
 file_names = {}
 user_selected_slot = {}
+registered_users = set()
+user_usernames = {}
+user_time_balance = {}
+referred_tracker = set()
+pro_users = set()
 
-# --- NEW TRACKERS (DATABASE MEMORY) ---
-registered_users = set()        # Bot ကို သုံးဖူးသမျှ user status သိရန် (Set)
-user_usernames = {}            # { uid: username } ပုံစံသိမ်းရန်
-user_time_balance = {}         # { uid: time_object } အချိန်လက်ကျန်မှတ်ရန်
-referred_tracker = set()       # အချင်းချင်း ဒုတိယအကြိမ် ထပ်လင့်နှိပ်ပြီး point ခိုးယူခြင်းမှ ကာကွယ်ရန်
-pro_users = set()              # အချိန်အကန့်အသတ်မရှိ (Unlimited Free) သုံးခွင့်ရမည့် VIP User များ
+# --- LOAD/SAVE DATA FUNCTIONS ---
+def load_data():
+    global registered_users, user_usernames, user_time_balance, pro_users, referred_tracker
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                registered_users = set(data.get('registered_users', []))
+                user_usernames = data.get('user_usernames', {})
+                pro_users = set(data.get('pro_users', []))
+                referred_tracker = set(data.get('referred_tracker', []))
+                # Convert time strings back to datetime
+                time_balance_data = data.get('user_time_balance', {})
+                for uid, time_str in time_balance_data.items():
+                    if time_str:
+                        user_time_balance[uid] = datetime.fromisoformat(time_str)
+                print(f"✅ Data loaded: {len(registered_users)} users")
+        except Exception as e:
+            print(f"Error loading data: {e}")
 
-# Active Multi-instance ကောင်တာ အတွက် Helper
+def save_data():
+    try:
+        # Convert datetime to string for JSON
+        time_balance_data = {}
+        for uid, time_obj in user_time_balance.items():
+            time_balance_data[uid] = time_obj.isoformat() if time_obj else None
+        
+        data = {
+            'registered_users': list(registered_users),
+            'user_usernames': user_usernames,
+            'user_time_balance': time_balance_data,
+            'pro_users': list(pro_users),
+            'referred_tracker': list(referred_tracker)
+        }
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"✅ Data saved: {len(registered_users)} users")
+    except Exception as e:
+        print(f"Error saving data: {e}")
+
+# --- FLASK ROUTES ---
+@app.route('/')
+def index():
+    return {
+        'status': 'running',
+        'bot_name': 'Vortexa Ultimate Cloud Bot',
+        'version': '12.0',
+        'active_users': len(registered_users),
+        'total_bots': sum(len(procs) for procs in running_processes.values()),
+        'timestamp': datetime.now().isoformat()
+    }, 200
+
+@app.route('/health')
+def health():
+    return {'status': 'healthy'}, 200
+
+@app.route(f'/webhook/{API_TOKEN}', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    return 'Bad Request', 400
+
+# --- HELPER FUNCTIONS ---
 def count_active_bots(uid):
     if uid not in running_processes:
         return 0
     return sum(1 for pid in running_processes[uid].values() if pid.poll() is None)
 
-# အချိန်လက်ကျန် ရှိ/မရှိ စစ်ဆေးပေးမည့် Helper
 def has_remaining_time(uid):
     if uid == ADMIN_CHAT_ID or uid in pro_users:
-        return True  # Admin နှင့် VIP User များသည် Free Run လို့ရသည်
+        return True
     if uid not in user_time_balance:
         return False
     return datetime.now() < user_time_balance[uid]
 
-# ကျန်ရှိချိန်ကို စာသားအဖြစ် ပြောင်းပေးမည့် Helper
 def get_time_balance_string(uid):
     if uid == ADMIN_CHAT_ID:
         return "♾️ Unlimited (Administrator Free)"
@@ -60,6 +133,15 @@ def get_time_balance_string(uid):
     hours = diff.seconds // 3600
     minutes = (diff.seconds % 3600) // 60
     return f"⏳ {days}d {hours}h {minutes}m remaining"
+
+def add_time_to_user(uid, minutes):
+    if uid in pro_users or uid == ADMIN_CHAT_ID:
+        return
+    if uid not in user_time_balance or user_time_balance[uid] < datetime.now():
+        user_time_balance[uid] = datetime.now() + timedelta(minutes=minutes)
+    else:
+        user_time_balance[uid] += timedelta(minutes=minutes)
+    save_data()
 
 # --- UI COMPONENTS ---
 def get_dashboard_markup(uid):
@@ -113,41 +195,94 @@ def get_reply_keyboard():
     return markup
 
 # --- CORE FUNCTIONS ---
+def launch_bot(uid, slot):
+    if not has_remaining_time(uid):
+        return "NO_TIME"
+        
+    path = os.path.join(HOST_DIR, uid, slot, "main.py")
+    log_path = os.path.join(HOST_DIR, uid, slot, "bot.log")
+    
+    if not os.path.exists(path):
+        return "NO_FILE"
+    
+    try:
+        # Stop existing bot if running
+        if uid in running_processes and slot in running_processes[uid]:
+            if running_processes[uid][slot].poll() is None:
+                running_processes[uid][slot].terminate()
+                time.sleep(1)
+                if running_processes[uid][slot].poll() is None:
+                    running_processes[uid][slot].kill()
+        
+        # Ensure log directory exists
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        
+        # Open log file
+        log_file = open(log_path, "a")
+        log_file.write(f"\n--- Bot Started at {datetime.now()} ---\n")
+        log_file.flush()
+        
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        
+        process = subprocess.Popen(
+            [sys.executable, path],
+            stdout=log_file,
+            stderr=log_file,
+            text=True,
+            env=env
+        )
+        
+        if uid not in running_processes:
+            running_processes[uid] = {}
+        if uid not in start_times:
+            start_times[uid] = {}
+            
+        running_processes[uid][slot] = process
+        start_times[uid][slot] = time.time()
+        
+        return "SUCCESS"
+    except Exception as e:
+        print(f"Launch error: {e}")
+        return "ERROR"
+
+# --- TELEGRAM BOT HANDLERS ---
 @bot.message_handler(commands=['start'])
 def dashboard(message):
     uid = str(message.chat.id)
     username = message.from_user.username if message.from_user.username else "No_Username"
     
-    # User စာရင်း သွင်းခြင်း
-    registered_users.add(uid)
-    user_usernames[uid] = f"@{username}"
+    # Register user
+    if uid not in registered_users:
+        registered_users.add(uid)
+        user_usernames[uid] = f"@{username}"
+        save_data()
     
-    # --- REFERRAL LOGIC ENGINE ---
+    # Check for referral
     msg_text = message.text
     if len(msg_text.split()) > 1 and msg_text.split()[1].startswith("ref_"):
         referrer_id = msg_text.split()[1].replace("ref_", "")
         
         if referrer_id != uid and uid not in referred_tracker:
-            referred_tracker.add(uid)  
+            referred_tracker.add(uid)
+            add_time_to_user(referrer_id, 30)
+            save_data()
             
-            if referrer_id not in user_time_balance or user_time_balance[referrer_id] < datetime.now():
-                user_time_balance[referrer_id] = datetime.now() + timedelta(minutes=30)
-            else:
-                user_time_balance[referrer_id] += timedelta(minutes=30)
-                
             try:
                 bot.send_message(
-                    referrer_id, 
-                    f"🎉 **New Referral Alert!**\nUser @{username} က သင့်လင့်ခ်မှတစ်ဆင့် Join ခဲ့သည်။\n🎁 သင်သည် **+30 မိနစ်** Runtime လက်ဆောင် ရရှိပါပြီ။"
+                    referrer_id,
+                    f"🎉 **New Referral Alert!**\nUser @{username} joined using your link!\n🎁 You earned **+30 minutes** of runtime!"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error sending referral message: {e}")
 
+    # Initialize user slot if not exists
     if uid not in user_selected_slot:
         user_selected_slot[uid] = "1"
         
     current_slot = user_selected_slot[uid]
     
+    # Check if bot is running
     is_live = False
     if uid in running_processes and current_slot in running_processes[uid]:
         if running_processes[uid][current_slot].poll() is None:
@@ -194,174 +329,98 @@ def dashboard(message):
     bot.send_message(message.chat.id, dashboard_ui, reply_markup=get_reply_keyboard(), parse_mode='Markdown')
     bot.send_message(message.chat.id, f"🕹 **System Controller (Managing Slot {current_slot}):**", reply_markup=get_dashboard_markup(uid))
 
-def launch_bot(uid, slot):
-    if not has_remaining_time(uid):
-        return "NO_TIME"
-        
-    path = os.path.join(HOST_DIR, uid, slot, "main.py")
-    log_path = os.path.join(HOST_DIR, uid, slot, "bot.log")
-    if not os.path.exists(path):
-        return "NO_FILE"
-    try:
-        if uid in running_processes and slot in running_processes[uid]:
-            if running_processes[uid][slot].poll() is None:
-                running_processes[uid][slot].kill()
-        
-        log_file = open(log_path, "a")
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        
-        process = subprocess.Popen(
-            [sys.executable, path], 
-            stderr=log_file, 
-            stdout=log_file, 
-            text=True,
-            env=env
-        )
-        
-        if uid not in running_processes:
-            running_processes[uid] = {}
-        if uid not in start_times:
-            start_times[uid] = {}
-            
-        running_processes[uid][slot] = process
-        start_times[uid][slot] = time.time()
-        return "SUCCESS"
-    except Exception:
-        return "ERROR"
-
-# --- NEW ADMIN SYSTEM COMMANDS ---
-
+# --- ADMIN COMMANDS ---
 @bot.message_handler(commands=['promeb'])
 def admin_promeb(message):
     if str(message.chat.id) != ADMIN_CHAT_ID:
-        bot.reply_to(message, "❌ You are not authorized to use this admin command.")
+        bot.reply_to(message, "❌ You are not authorized!")
         return
         
     parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "⚠️ **Usage:** `/promeb <user_chat_id>`")
+        bot.reply_to(message, "⚠️ Usage: /promeb <user_chat_id>")
         return
         
     target_uid = parts[1]
     pro_users.add(target_uid)
-    registered_users.add(target_uid)  
+    registered_users.add(target_uid)
+    save_data()
     
     uname = user_usernames.get(target_uid, "Unknown User")
-    bot.send_message(ADMIN_CHAT_ID, f"✅ **PRO Upgrade Success!**\nUser ID `{target_uid}` ({uname}) အား အချိန်အကန့်အသတ်မရှိ (Unlimited VIP PRO) သုံးစွဲခွင့် ပေးအပ်လိုက်ပါပြီ။")
+    bot.send_message(ADMIN_CHAT_ID, f"✅ **PRO Upgrade Success!**\nUser {target_uid} ({uname}) is now VIP PRO!")
     
     try:
-        bot.send_message(target_uid, "🎉 **Congratulations!**\nAdmin မှ သင့်အား **Unlimited VIP PRO** အဆင့်သို့ တိုးမြှင့်ပေးလိုက်သဖြင့် ယခုမှစ၍ Bot ကို အချိန်အကန့်အသတ်မရှိ အခမဲ့ စိတ်ကြိုက် သုံးစွဲနိုင်ပါပြီ။")
+        bot.send_message(target_uid, "🎉 **Congratulations!**\nYou have been upgraded to **Unlimited VIP PRO** status!")
     except Exception:
         pass
 
 @bot.message_handler(commands=['promebdele'])
 def admin_promebdele(message):
     if str(message.chat.id) != ADMIN_CHAT_ID:
-        bot.reply_to(message, "❌ You are not authorized to use this admin command.")
+        bot.reply_to(message, "❌ You are not authorized!")
         return
         
     parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "⚠️ **Usage:** `/promebdele <user_chat_id>`")
+        bot.reply_to(message, "⚠️ Usage: /promebdele <user_chat_id>")
         return
         
     target_uid = parts[1]
     if target_uid in pro_users:
         pro_users.remove(target_uid)
-        uname = user_usernames.get(target_uid, "Unknown User")
-        bot.send_message(ADMIN_CHAT_ID, f"❌ **PRO Downgrade Success!**\nUser ID `{target_uid}` ({uname}) ၏ Unlimited VIP အခွင့်အရေးအား ပြန်လည်ရုပ်သိမ်းလိုက်ပါပြီ။")
-        
-        try:
-            bot.send_message(target_uid, "⚠️ **Notice:** သင့်၏ VIP PRO အဆင့်ကို Admin မှ ပြန်လည်ရုပ်သိမ်းလိုက်ပြီ ဖြစ်ပါသည်။ ပုံမှန် Referral စနစ်ဖြင့် အချိန်ပြန်လည်စုဆောင်းနိုင်ပါသည်။")
-        except Exception:
-            pass
-    else:
-        bot.send_message(ADMIN_CHAT_ID, f"⚠️ User ID `{target_uid}` သည် VIP စာရင်းထဲတွင် မရှိပါ။")
+        save_data()
+        bot.send_message(ADMIN_CHAT_ID, f"❌ **PRO Removed from {target_uid}**")
 
 @bot.message_handler(commands=['userlist'])
 def admin_userlist(message):
     if str(message.chat.id) != ADMIN_CHAT_ID:
-        bot.reply_to(message, "❌ You are not authorized to use this admin command.")
+        bot.reply_to(message, "❌ You are not authorized!")
         return
     
     if not registered_users:
-        bot.send_message(ADMIN_CHAT_ID, "📊 **Registered Users:**\nNo users have registered yet.")
+        bot.send_message(ADMIN_CHAT_ID, "No users registered yet.")
         return
         
-    user_list_msg = "📊 **ADVANCED USER & DEPLOYMENT REPORT:**\n━━━━━━━━━━━━━━━━━━━━━━\n"
+    user_list = "📊 **Registered Users:**\n━━━━━━━━━━━━━━━━\n"
+    for idx, uid in enumerate(sorted(registered_users), 1):
+        uname = user_usernames.get(uid, "@Unknown")
+        status = "👑 OWNER" if uid == ADMIN_CHAT_ID else "💎 VIP" if uid in pro_users else "👤 USER"
+        user_list += f"{idx}. {uname} - {status}\n   ID: `{uid}`\n\n"
+        
+        if len(user_list) > 3500:
+            bot.send_message(ADMIN_CHAT_ID, user_list, parse_mode='Markdown')
+            user_list = ""
     
-    for idx, user_id in enumerate(sorted(registered_users), start=1):
-        uname = user_usernames.get(user_id, "@No_Username")
-        
-        if user_id == ADMIN_CHAT_ID:
-            status_tag = "👑 [OWNER]"
-        elif user_id in pro_users:
-            status_tag = "💎 [VIP PRO]"
-        else:
-            status_tag = "👤 [NORMAL]"
-            
-        user_list_msg += f"{idx}. **User:** {uname} (ID: `{user_id}`) {status_tag}\n"
-        
-        uploaded_files_info = []
-        total_files_count = 0
-        
-        for slot_num in range(1, 4):
-            slot_str = str(slot_num)
-            file_name = "None"
-            if user_id in file_names and slot_str in file_names[user_id]:
-                file_name = file_names[user_id][slot_str]
-            
-            path = os.path.join(HOST_DIR, user_id, slot_str, "main.py")
-            if os.path.exists(path):
-                if file_name == "None":
-                    file_name = "main.py (Recovered)"
-                uploaded_files_info.append(f"   ┣ 🔹 Slot {slot_str}: `{file_name}`")
-                total_files_count += 1
-            else:
-                uploaded_files_info.append(f"   ┣ 🔹 Slot {slot_str}: `Empty ⚪`")
-                
-        user_list_msg += f"   ┗ 📂 **Total Deployed:** `{total_files_count} / 3 Files`\n"
-        for slot_line in uploaded_files_info:
-            user_list_msg += f"{slot_line}\n"
-        user_list_msg += "──────────────────────\n"
-        
-        if len(user_list_msg) > 3500:
-            bot.send_message(ADMIN_CHAT_ID, user_list_msg, parse_mode='Markdown')
-            user_list_msg = ""
-
-    if user_list_msg:
-        bot.send_message(ADMIN_CHAT_ID, user_list_msg, parse_mode='Markdown')
+    if user_list:
+        bot.send_message(ADMIN_CHAT_ID, user_list, parse_mode='Markdown')
 
 @bot.message_handler(commands=['allmessage'])
 def admin_broadcast(message):
     if str(message.chat.id) != ADMIN_CHAT_ID:
-        bot.reply_to(message, "❌ You are not authorized to use this admin command.")
+        bot.reply_to(message, "❌ You are not authorized!")
         return
         
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(message, "⚠️ **Usage:** `/allmessage <သင့်စာသား>`")
+        bot.reply_to(message, "⚠️ Usage: /allmessage <message>")
         return
         
     broadcast_text = parts[1]
-    success_count = 0
+    success = 0
     
-    status_msg = bot.send_message(ADMIN_CHAT_ID, "📢 **Sending broadcast message to all users...**")
-    
-    for user_id in registered_users:
+    for uid in registered_users:
         try:
-            bot.send_message(user_id, f"📢 **[GLOBAL ANNOUNCEMENT FROM ADMIN]**\n\n{broadcast_text}")
-            success_count += 1
-            time.sleep(0.05)  
-        except Exception:
-            continue
-            
-    bot.edit_message_text(f"✅ **Broadcast Completed!**\nSuccessfully sent to `{success_count}` users.", ADMIN_CHAT_ID, status_msg.message_id)
+            bot.send_message(uid, f"📢 **ANNOUNCEMENT FROM ADMIN**\n\n{broadcast_text}")
+            success += 1
+            time.sleep(0.05)
+        except:
+            pass
+    
+    bot.send_message(ADMIN_CHAT_ID, f"✅ Broadcast sent to {success} users!")
 
-# --- CALLBACKS ---
+# --- CALLBACK HANDLERS ---
 @bot.callback_query_handler(func=lambda call: True)
-def callbacks(call):
+def handle_callback(call):
     uid = str(call.message.chat.id)
     
     if call.data.startswith("select_slot_"):
@@ -370,8 +429,7 @@ def callbacks(call):
         bot.answer_callback_query(call.id, f"Switched to Slot {slot}")
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
-            bot.delete_message(call.message.chat.id, call.message.message_id - 1)
-        except Exception:
+        except:
             pass
         dashboard(call.message)
         return
@@ -381,8 +439,12 @@ def callbacks(call):
     if call.data.startswith("stop_"):
         slot = call.data.split("_")[-1]
         if uid in running_processes and slot in running_processes[uid]:
-            running_processes[uid][slot].kill()
-            bot.send_message(call.message.chat.id, f"🛑 **Slot {slot} Terminated.** Bot has been stopped.")
+            if running_processes[uid][slot].poll() is None:
+                running_processes[uid][slot].terminate()
+                time.sleep(1)
+                if running_processes[uid][slot].poll() is None:
+                    running_processes[uid][slot].kill()
+            bot.send_message(call.message.chat.id, f"🛑 **Slot {slot} Stopped!**")
             dashboard(call.message)
             
     elif call.data.startswith("launch_"):
@@ -392,109 +454,38 @@ def callbacks(call):
             bot.answer_callback_query(call.id, f"🚀 Launching Slot {slot}...")
             dashboard(call.message)
         elif result == "NO_TIME":
-            bot.answer_callback_query(call.id, "❌ Run failed! No remaining runtime balance.", show_alert=True)
-            bot.send_message(call.message.chat.id, "⚠️ **သင့်မှာ Hosting Run ရန် အချိန်မရှိတော့ပါ။** ကျေးဇူးပြု၍ သူငယ်ချင်းများကို ဖိတ်ခေါ်ပြီး မိနစ်များ စုဆောင်းပါ။")
+            bot.answer_callback_query(call.id, "❌ No time remaining!", show_alert=True)
         else:
-            bot.answer_callback_query(call.id, "❌ Launch failed.")
+            bot.answer_callback_query(call.id, "❌ Launch failed!")
             
     elif call.data == "refresh":
-        bot.answer_callback_query(call.id, "Syncing real-time data...")
+        bot.answer_callback_query(call.id, "Refreshing...")
         dashboard(call.message)
         
     elif call.data.startswith("deploy_"):
         slot = call.data.split("_")[-1]
         user_selected_slot[uid] = slot
-        bot.send_message(call.message.chat.id, f"📤 **Please upload your Python (.py) script for [Slot {slot}].**")
+        bot.send_message(call.message.chat.id, f"📤 **Send your Python (.py) file for Slot {slot}**")
         
     elif call.data.startswith("logs_"):
         slot = call.data.split("_")[-1]
         log_path = os.path.join(HOST_DIR, uid, slot, "bot.log")
         if os.path.exists(log_path):
             with open(log_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                last_logs = "".join(lines[-30:]) if lines else "Log is empty but file exists."
-            
-            code_block_tag = "```"
-            log_msg = f"📋 **Live Logs for Slot {slot}:**\n{code_block_tag}\n{last_logs}\n{code_block_tag}"
-            bot.send_message(call.message.chat.id, log_msg, parse_mode='Markdown')
+                lines = f.readlines()[-30:]
+                logs = "".join(lines) if lines else "Log file is empty."
+            bot.send_message(call.message.chat.id, f"📋 **Logs for Slot {slot}:**\n```\n{logs}\n```", parse_mode='Markdown')
         else:
-            bot.send_message(call.message.chat.id, f"❌ **No log data found for Slot {slot}**.")
+            bot.send_message(call.message.chat.id, f"❌ No logs found for Slot {slot}")
 
 # --- TEXT HANDLERS ---
-@bot.message_handler(func=lambda m: True)
-def handle_text(message):
-    uid = str(message.chat.id)
-    username = message.from_user.username if message.from_user.username else "No_Username"
-    
-    registered_users.add(uid)
-    user_usernames[uid] = f"@{username}"
-
-    if uid not in user_selected_slot:
-        user_selected_slot[uid] = "1"
-    current_slot = user_selected_slot[uid]
-    
-    if message.text in ['🖥 Dashboard', '⚙️ Control Center']:
-        dashboard(message)
-    elif message.text == '🚀 Deploy Bot':
-        bot.send_message(message.chat.id, f"📤 **Ready for deployment.** Send your file for **[Slot {current_slot}]**.")
-    elif message.text == '📊 Server Status':
-        active_global = 0
-        for u in running_processes:
-            for s in running_processes[u]:
-                if running_processes[u][s].poll() is None:
-                    active_global += 1
-        bot.send_message(message.chat.id, f"📊 **Network Node:** `Stable` ✅\n👥 **Global Instances:** `{active_global}` live globally.")
-    elif message.text in ['📁 My Projects']:
-        status_text = "📂 **Your Workspace Status:**\n\n"
-        for i in range(1, 4):
-            slot_str = str(i)
-            name = "Empty Slot"
-            if uid in file_names and slot_str in file_names[uid]:
-                name = file_names[uid][slot_str]
-                
-            is_running = False
-            if uid in running_processes and slot_str in running_processes[uid]:
-                if running_processes[uid][slot_str].poll() is None:
-                    is_running = True
-            
-            state = "🟢 RUNNING" if is_running else "🔴 STOPPED"
-            status_text += f"**Slot {i}:** `{name}` | Status: {state}\n"
-            
-        bot.send_message(message.chat.id, status_text, parse_mode='Markdown')
-        
-    elif message.text in ['🔗 Get Invite Link', '/newmeb']:
-        try:
-            bot_info = bot.get_me()
-            bot_username = bot_info.username
-            
-            # Referral Link Format Fix
-            ref_link = f"https://t.me/{bot_username}?start=ref_{uid}"
-            
-            invitation_msg = (
-                f"🔗 *မြန်မာနိုင်ငံ၏ ပထမဆုံးသော အခမဲ့ Multi-Slot Bot Hosting*\n\n"
-                f"အောက်ပါ လင့်ခ်ကိုအသုံးပြုပြီး Bot ကို ဝင်ရောက်အသုံးပြုပါက ဖိတ်ခေါ်သူသည် မိနစ် ၃၀ အခမဲ့ Hosting သုံးစွဲခွင့် ထပ်တိုးရရှိပါမည်။\n\n"
-                f"👇 ဒီလင့်ခ်ကို နှိပ်ပြီးဝင်ပါ 👇\n"
-                f"[{ref_link}]({ref_link})\n\n"
-                f"👥 *ဆုကြေးအစီအစဉ်:*\n"
-                f"• လူတစ်ယောက်ခေါ်လျှင် = `၃၀ မိနစ်` Runtime 🎁\n"
-                f"• လူနှစ်ယောက်ခေါ်လျှင် = `၁ နာရီ` Runtime 🎁"
-            )
-            
-            bot.send_message(uid, invitation_msg, parse_mode='Markdown', disable_web_page_preview=True)
-        except Exception as e:
-            bot.send_message(uid, f"❌ **Error generating invite link:** `{str(e)}`")
-        
-    elif message.text == '🆘 Help Desk':
-        bot.send_message(uid, f"🆘 **Support Center:**\nContact {ADMIN_USERNAME} for assistance.")
-
-# --- DEPLOYMENT ENGINE ---
 @bot.message_handler(content_types=['document'])
-def deploy_engine(message):
+def handle_file(message):
     if message.document.file_name.endswith('.py'):
         uid = str(message.chat.id)
         
         if not has_remaining_time(uid):
-            bot.reply_to(message, "❌ **Deployment Denied.** သင့်မှာ runtime အချိန်မကျန်တော့ပါ။ ကျေးဇူးပြု၍ သူငယ်ချင်းများကိုဖိတ်ခေါ်ပြီး အချိန်အရင်ယူပါ။")
+            bot.reply_to(message, "❌ No runtime remaining! Invite friends to get more time.")
             return
             
         if uid not in user_selected_slot:
@@ -505,58 +496,127 @@ def deploy_engine(message):
             file_names[uid] = {}
         file_names[uid][current_slot] = message.document.file_name
         
-        status_msg = bot.reply_to(message, f"⚙️ **Initializing Build Environment for Slot {current_slot}...**")
+        status_msg = bot.reply_to(message, f"⚙️ Deploying to Slot {current_slot}...")
         
+        # Download file
         file_info = bot.get_file(message.document.file_id)
         data = bot.download_file(file_info.file_path)
         
-        path = os.path.join(HOST_DIR, uid, current_slot, "main.py")
-        log_path = os.path.join(HOST_DIR, uid, current_slot, "bot.log")
+        # Save file
+        slot_dir = os.path.join(HOST_DIR, uid, current_slot)
+        os.makedirs(slot_dir, exist_ok=True)
         
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        
-        if os.path.exists(log_path):
-            os.remove(log_path)
-            
+        path = os.path.join(slot_dir, "main.py")
         with open(path, 'wb') as f:
             f.write(data)
-
+        
+        # Launch bot
         result = launch_bot(uid, current_slot)
         if result == "SUCCESS":
-            bot.edit_message_text(f"✅ **DEPLOYMENT SUCCESSFUL TO SLOT {current_slot}!**\nInstance node is now live.", message.chat.id, status_msg.message_id)
-        elif result == "NO_TIME":
-            bot.edit_message_text(f"❌ **BOOT ERROR.** Runtime balance မရှိတော့ပါ။", message.chat.id, status_msg.message_id)
+            bot.edit_message_text(f"✅ **Deployed to Slot {current_slot}!**\nBot is now running.", message.chat.id, status_msg.message_id)
         else:
-            bot.edit_message_text(f"❌ **BOOT ERROR ON SLOT {current_slot}.** Please check your script code.", message.chat.id, status_msg.message_id)
+            bot.edit_message_text(f"❌ **Deployment failed!** Check your code.", message.chat.id, status_msg.message_id)
 
-# --- AUTO TIME KILLER BACKGROUND THREAD ---
-def time_enforcer_loop():
-    while True:
-        current_time = datetime.now()
-        for uid in list(running_processes.keys()):
-            if uid == ADMIN_CHAT_ID or uid in pro_users:
-                continue  
-                
-            if uid in user_time_balance and current_time >= user_time_balance[uid]:
-                for slot in list(running_processes[uid].keys()):
-                    if running_processes[uid][slot].poll() is None:
-                        running_processes[uid][slot].kill()  
-                        try:
-                            bot.send_message(int(uid), f"⚠️ **Notice:** သင့်ရဲ့ အခမဲ့ သုံးစွဲခွင့် Runtime သက်တမ်း ကုန်ဆုံးသွားသဖြင့် **Slot {slot}** ရှိ Bot အား ခေတ္တရပ်ဆိုင်းလိုက်ရပါသည်။ ဆက်လက်သုံးစွဲရန် သူငယ်ချင်းများကို ထပ်မံဖိတ်ခေါ်ပေးပါ။")
-                        except Exception:
-                            pass
-                del running_processes[uid]
-        time.sleep(30) 
+@bot.message_handler(func=lambda m: True)
+def handle_text(message):
+    uid = str(message.chat.id)
+    
+    if uid not in user_selected_slot:
+        user_selected_slot[uid] = "1"
+    current_slot = user_selected_slot[uid]
+    
+    if message.text == '🖥 Dashboard':
+        dashboard(message)
+    elif message.text == '🚀 Deploy Bot':
+        bot.send_message(message.chat.id, f"📤 Send your Python file for Slot {current_slot}")
+    elif message.text == '📊 Server Status':
+        active = sum(1 for u in running_processes for s in running_processes[u] if running_processes[u][s].poll() is None)
+        bot.send_message(message.chat.id, f"📊 **Server Status**\n━━━━━━━━━━━━\n✅ Status: Online\n🤖 Active Bots: {active}\n👥 Users: {len(registered_users)}")
+    elif message.text == '📁 My Projects':
+        status_text = "📂 **Your Projects:**\n━━━━━━━━━━━━\n"
+        for i in range(1, 4):
+            slot = str(i)
+            name = file_names.get(uid, {}).get(slot, "Empty")
+            is_running = uid in running_processes and slot in running_processes[uid] and running_processes[uid][slot].poll() is None
+            status = "🟢 Running" if is_running else "🔴 Stopped"
+            status_text += f"Slot {i}: {name}\nStatus: {status}\n\n"
+        bot.send_message(message.chat.id, status_text)
+    elif message.text == '🔗 Get Invite Link':
+        bot_info = bot.get_me()
+        link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
+        bot.send_message(message.chat.id, f"🔗 **Your Invite Link:**\n{link}\n\n🎁 Get 30 minutes per referral!")
+    elif message.text == '🆘 Help Desk':
+        bot.send_message(message.chat.id, f"🆘 **Support**\nContact: {ADMIN_USERNAME}\n\nCommands:\n/start - Main menu\n/promeb - Admin only\n/userlist - Admin only")
 
-if __name__ == "__main__":
-    print(f">>> VORTEXA MULTI-INSTANCE CLOUD v12.0 IS LIVE WITH REFERRAL & ADMIN ENGINE")
-    
-    t = threading.Thread(target=time_enforcer_loop, daemon=True)
-    t.start()
-    
+# --- TIME ENFORCER THREAD ---
+def time_enforcer():
     while True:
         try:
-            bot.polling(non_stop=True, interval=1)
+            current_time = datetime.now()
+            for uid in list(running_processes.keys()):
+                if uid == ADMIN_CHAT_ID or uid in pro_users:
+                    continue
+                    
+                if uid in user_time_balance and current_time >= user_time_balance[uid]:
+                    for slot in list(running_processes[uid].keys()):
+                        if running_processes[uid][slot].poll() is None:
+                            running_processes[uid][slot].terminate()
+                            try:
+                                bot.send_message(int(uid), f"⚠️ Your runtime has expired! Bot in Slot {slot} has been stopped.")
+                            except:
+                                pass
+                    del running_processes[uid]
         except Exception as e:
-            print(f"Main Bot Crash Prevented: {e}")
-            time.sleep(5)
+            print(f"Time enforcer error: {e}")
+        time.sleep(30)
+
+# --- DATA SAVE THREAD ---
+def auto_save():
+    while True:
+        time.sleep(60)  # Save every minute
+        save_data()
+
+# --- MAIN EXECUTION ---
+if __name__ == '__main__':
+    print("=" * 50)
+    print("🚀 VORTEXA ULTIMATE CLOUD v12.0")
+    print("=" * 50)
+    
+    # Load existing data
+    load_data()
+    
+    # Start background threads
+    t1 = threading.Thread(target=time_enforcer, daemon=True)
+    t1.start()
+    
+    t2 = threading.Thread(target=auto_save, daemon=True)
+    t2.start()
+    
+    # Get port for Render
+    port = int(os.environ.get('PORT', 8080))
+    
+    # Check if running on Render
+    if os.environ.get('RENDER'):
+        print(f"✅ Running on Render - Port: {port}")
+        print(f"📍 Webhook URL: {RENDER_URL}/webhook/{API_TOKEN}")
+        
+        # Setup webhook
+        bot.remove_webhook()
+        time.sleep(1)
+        
+        webhook_url = f"{RENDER_URL}/webhook/{API_TOKEN}"
+        result = bot.set_webhook(url=webhook_url)
+        
+        if result:
+            print("✅ Webhook set successfully!")
+        else:
+            print("❌ Webhook setup failed!")
+        
+        # Start Flask app
+        app.run(host='0.0.0.0', port=port)
+    else:
+        # Local development with polling
+        print("✅ Running locally - Polling mode")
+        bot.remove_webhook()
+        print("🤖 Bot is polling for updates...")
+        bot.infinity_polling(timeout=30, long_polling_timeout=30)
